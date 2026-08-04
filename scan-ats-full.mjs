@@ -92,8 +92,24 @@ const RESOLVER_FAILURE_LIMIT = 50;
 // Crash insurance for multi-hour directory sweeps: progress + matches are
 // checkpointed every CHECKPOINT_EVERY companies so --resume can continue a
 // dead run (with its ORIGINAL date window) instead of restarting from zero.
-const CHECKPOINT_PATH = 'data/cache/ats-full-checkpoint.json';
+//
+// Overridable via CAREER_OPS_CHECKPOINT_PATH so a sweep sharded across runs (one
+// --ats subset per day, to fit a scheduler's per-run time cap) can give each
+// shard its own file. Sharing one would have every shard clobber the last, and
+// checkpointCompatible() rejects a checkpoint written under a different --ats,
+// so every --resume would then fail with "different settings". Unset keeps the
+// original path, so default behaviour is unchanged.
+const CHECKPOINT_PATH = process.env.CAREER_OPS_CHECKPOINT_PATH || 'data/cache/ats-full-checkpoint.json';
 const CHECKPOINT_EVERY = 500;
+
+// Wall-clock ceiling for the --liveness pass. It is sequential by project rule
+// and runs AFTER every source completes but BEFORE appendToPipeline, so an
+// overrun does not merely truncate verification — under a scheduler that kills
+// the process it discards the whole sweep. That is what happened to the
+// 2026-08-02 cron run: 38,854 boards swept in 48 min, then 1,205 sequential
+// checks could not fit the hour-long script cap, and every match was lost.
+// Override with LIVENESS_BUDGET_MS (0 = verify nothing, pass everything through).
+const DEFAULT_LIVENESS_BUDGET_MS = 35 * 60_000;
 
 export function loadCheckpoint(file = CHECKPOINT_PATH) {
   if (!existsSync(file)) return null;
@@ -585,6 +601,19 @@ export async function parallelEach(items, limit, fn, onItemDone = null, shouldSt
 
 // ── Liveness verification (reuses liveness-browser.mjs) ────────────
 
+// Non-negative finite override only; anything else keeps the default rather than
+// letting a typo (LIVENESS_BUDGET_MS=35m) silently mean "no budget at all".
+export function livenessBudgetMs(env = process.env) {
+  const raw = env.LIVENESS_BUDGET_MS;
+  if (raw === undefined || raw === '') return DEFAULT_LIVENESS_BUDGET_MS;
+  const ms = Number(raw);
+  if (!Number.isFinite(ms) || ms < 0) {
+    console.error(`⚠ ignoring invalid LIVENESS_BUDGET_MS=${raw} — using default ${DEFAULT_LIVENESS_BUDGET_MS}ms`);
+    return DEFAULT_LIVENESS_BUDGET_MS;
+  }
+  return ms;
+}
+
 async function filterLive(offers) {
   let chromium, checkUrlLiveness, newLivenessPage;
   try {
@@ -596,13 +625,26 @@ async function filterLive(offers) {
       { cause: err },
     );
   }
-  console.error(`\nVerifying liveness of ${offers.length} match(es) with Playwright (sequential)...`);
+  const budgetMs = livenessBudgetMs();
+  console.error(`\nVerifying liveness of ${offers.length} match(es) with Playwright (sequential, ${Math.round(budgetMs / 60_000)}m budget)...`);
   const browser = await chromium.launch({ headless: true });
   const live = [];
+  let unverified = 0;
+  const startedAt = Date.now();
   try {
     const page = await newLivenessPage(browser);
     // Sequential — project rule: never Playwright in parallel
-    for (const offer of offers) {
+    for (const [i, offer] of offers.entries()) {
+      // Out of budget: pass the tail through UNVERIFIED rather than unwritten.
+      // No new semantics — 'uncertain' is already kept and re-checked next scan,
+      // so the worst case is a closed posting surviving one extra cycle. Losing
+      // the whole sweep to a mid-verify kill is strictly worse.
+      if (Date.now() - startedAt >= budgetMs) {
+        unverified = offers.length - i;
+        live.push(...offers.slice(i));
+        console.error(`  ⏱ budget spent after ${i} check(s) — ${unverified} offer(s) passed through UNVERIFIED`);
+        break;
+      }
       const { result, reason } = await checkUrlLiveness(page, offer.url);
       const icon = result === 'active' ? '✅' : result === 'expired' ? '❌' : '⚠️';
       console.error(`  ${icon} ${result.padEnd(9)} ${offer.company} | ${offer.title}${result === 'expired' ? ` (${reason})` : ''}`);
@@ -611,7 +653,7 @@ async function filterLive(offers) {
   } finally {
     await browser.close();
   }
-  console.error(`  → ${live.length}/${offers.length} passed liveness`);
+  console.error(`  → ${live.length}/${offers.length} passed liveness${unverified ? ` (${unverified} unverified)` : ''}`);
   return live;
 }
 
