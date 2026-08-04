@@ -156,3 +156,12 @@ documents/*
 # Intake fingerprints — the recorded source filenames may themselves carry
 # PII (e.g. cv/jane-doe-master-cv.pdf). #1723
 data/intake-state.json
+
+# Personal CV PDF — keep out of the public fork
+justin-fabricius-cv.pdf
+
+# Custom user-layer tooling (not upstream): chromium fallback for companies with
+# no public ATS API, plus its dedup history. Ignored so update-system.mjs and
+# upstream merges never clobber them.
+careers-render-scan.mjs
+data/render-scan-history.tsv
